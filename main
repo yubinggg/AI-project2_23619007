@@ -1,0 +1,792 @@
+# ============================================
+# 데이터 준비 → 학습 → 평가(ROC) → Grad-CAM(Fake-only) + BLIP 근거
+# - ImageFolder 라벨 매핑 안전화(fake=1, real=0)
+# - AMP 일관 적용, Grad-CAM은 target=fake(1) 고정
+# - 평가 변환 Resize((224,224))
+# - 패널 텍스트를 이미지 '아래'에 배치
+# - 새 경로: /content/drive/MyDrive/celeba_hq_binary_224_new (이미 224 리사이즈 완료)
+# ============================================
+
+!pip install -q opencv-python-headless==4.10.0.84 \
+               transformers==4.44.2 accelerate==0.34.2 timm==1.0.9 \
+               scikit-learn==1.5.1 tqdm==4.66.4
+
+# -------------------------
+# 0) 기본 라이브러리 불러오기
+# -------------------------
+import os, glob, json, csv, math, shutil, random
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, Subset
+import torchvision.transforms.functional as TF
+
+import cv2
+
+from sklearn.metrics import roc_curve, auc
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# -------------------------
+# 1) 경로 및 옵션 설정
+# -------------------------
+USE_LOCAL_COPY = False       # 이미 Drive에 224 데이터 있음 → 그대로 사용
+MAX_WORKERS    = 4
+TARGET_SIDE    = 224
+
+# 전체 데이터 사용
+FRACTION_TRAIN = 1.0
+FRACTION_VAL   = 1.0
+FRACTION_TEST  = 1.0
+
+EPOCHS = 20
+LR = 1e-3
+WD = 1e-4
+patience = 5  # early stop
+
+ROOT_DRIVE = "/content/drive/MyDrive"
+
+# 새로 재구성한 224 데이터 경로
+SRC_DRIVE  = f"{ROOT_DRIVE}/celeba_hq_binary_224_new"       # 실제 이미지(이미 224x224)
+DST_DRIVE  = SRC_DRIVE                                      # 별도 리사이즈 없이 그대로 사용
+META_DRIVE = f"{ROOT_DRIVE}/celeba_hq_binary_224_new_meta"  # 메타/모델 저장
+
+# 로컬 복사 경로(이번에는 사용하지 않지만, 구조는 그대로 둠)
+SRC_LOCAL = "/content/celeba_hq_binary_224_new"
+DST_LOCAL = SRC_LOCAL
+META_LOCAL= META_DRIVE
+
+# 이번 설정에서는 USE_LOCAL_COPY=False 이므로 Drive 경로 직접 사용
+SRC  = SRC_DRIVE
+DST  = DST_DRIVE
+META = META_DRIVE
+
+# train/val/test, real/fake 구조가 잘 있는지 확인
+for sp in ["train","val","test"]:
+    for lb in ["real","fake"]:
+        assert os.path.isdir(f"{SRC_DRIVE}/{sp}/{lb}"), f"[ERR] missing {SRC_DRIVE}/{sp}/{lb}"
+
+Path(META).mkdir(parents=True, exist_ok=True)
+random.seed(42)
+
+print("[OK] working paths:\n SRC:", SRC, "\n DST:", DST, "\n META:", META)
+
+# -------------------------
+# 2) Drive → Colab 동기화 (이번엔 스킵)
+# -------------------------
+if USE_LOCAL_COPY:
+    # 필요하면 나중에 True로 바꿔서 로컬 복사 사용 가능
+    for sp in ["train","val","test"]:
+        for lb in ["real","fake"]:
+            d_drive = f"{SRC_DRIVE}/{sp}/{lb}"
+            d_local = f"{SRC_LOCAL}/{sp}/{lb}"
+            Path(d_local).mkdir(parents=True, exist_ok=True)
+            local_names = {os.path.basename(p) for p in glob.glob(f"{d_local}/*")}
+            new_files = [p for p in glob.glob(f"{d_drive}/*") if os.path.basename(p) not in local_names]
+            for p in new_files:
+                shutil.copy2(p, os.path.join(d_local, os.path.basename(p)))
+    SRC = SRC_LOCAL
+    DST = DST_LOCAL
+    print("[INFO] Copied data to local disk.")
+else:
+    print("[INFO] Using Drive 224 데이터 직접 사용 (복사 없음).")
+
+print("[OK] 최종 데이터 경로:\n SRC:", SRC, "\n DST:", DST)
+
+# -------------------------
+# 3) 224 리사이즈 단계 (이미 리사이즈 완료라 스킵)
+# -------------------------
+print("[INFO] 이미 224x224로 리사이즈된 데이터 사용 → 리사이즈 단계 스킵.")
+
+# -------------------------
+# 4) 정규화 파라미터 (간단 버전: ImageNet mean/std 상수 사용)
+# -------------------------
+# ResNet이 사전 학습된 ImageNet 통계
+DMEAN = [0.485, 0.456, 0.406]
+DSTD  = [0.229, 0.224, 0.225]
+
+print("[OK] Using fixed ImageNet mean/std:", DMEAN, DSTD)
+
+# -------------------------
+# 5) 데이터셋/로더 구성 (라벨 매핑 안전화)
+# -------------------------
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
+    transforms.RandomHorizontalFlip(0.5),
+    transforms.ColorJitter(0.2,0.2,0.2,0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=DMEAN, std=DSTD)
+])
+eval_tf = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=DMEAN, std=DSTD)
+])
+
+_tmp = datasets.ImageFolder(f"{DST}/train")
+CLASSES = _tmp.classes  # 보통 ['fake','real'] 또는 ['real','fake']
+print("[INFO] CLASSES =", CLASSES)
+
+def remap_target(y):
+    # ImageFolder 클래스 이름 기준으로 fake=1, real=0 강제
+    return 1 if CLASSES[y] == 'fake' else 0
+
+train_full = datasets.ImageFolder(f"{DST}/train", transform=train_tf, target_transform=remap_target)
+val_full   = datasets.ImageFolder(f"{DST}/val",   transform=eval_tf,  target_transform=remap_target)
+test_full  = datasets.ImageFolder(f"{DST}/test",  transform=eval_tf,  target_transform=remap_target)
+
+def subset_by_fraction(dataset, frac, seed=42):
+    if frac >= 1.0:
+        return dataset
+    n_total = len(dataset)
+    n_keep  = max(1, int(n_total * frac))
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(n_total, generator=g)[:n_keep].tolist()
+    return Subset(dataset, idx)
+
+train_ds = subset_by_fraction(train_full, FRACTION_TRAIN)
+val_ds   = subset_by_fraction(val_full,   FRACTION_VAL)
+test_ds  = subset_by_fraction(test_full,  FRACTION_TEST)
+
+print(f"[INFO] sizes -> train:{len(train_ds)} val:{len(val_ds)} test:{len(test_ds)}")
+
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True,  num_workers=MAX_WORKERS, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False, num_workers=MAX_WORKERS, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=64, shuffle=False, num_workers=MAX_WORKERS, pin_memory=True)
+print("[OK] DataLoader 준비 완료")
+
+# -------------------------
+# 6) 모델 학습 설정
+# -------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def build_resnet50(num_classes=2):
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+    in_features = model.fc.in_features
+    model.fc = nn.Sequential(nn.Dropout(0.2), nn.Linear(in_features, num_classes))
+    return model
+
+model = build_resnet50().to(DEVICE)
+optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+criterion_train = nn.CrossEntropyLoss(label_smoothing=0.1)
+criterion_eval  = nn.CrossEntropyLoss()
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+scaler = torch.amp.GradScaler('cuda' if DEVICE.type=='cuda' else 'cpu')
+
+# -------------------------
+# 7) 학습 루프
+# -------------------------
+def run_epoch(loader, train=True):
+    model.train() if train else model.eval()
+    loss_sum, correct, total = 0.0, 0, 0
+    for xb,yb in loader:
+        xb,yb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.set_grad_enabled(train), torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            logits = model(xb)
+            loss = criterion_train(logits,yb) if train else criterion_eval(logits,yb)
+        if train:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer); scaler.update()
+        pred = logits.argmax(1)
+        correct += (pred==yb).sum().item()
+        loss_sum += float(loss.item())*xb.size(0); total += xb.size(0)
+    return loss_sum/total, correct/total
+
+best_val = 0.0
+patience_counter = 0
+for ep in range(1, EPOCHS+1):
+    tr_loss,tr_acc = run_epoch(train_loader, True)
+    va_loss,va_acc = run_epoch(val_loader,   False)
+    sched.step()
+    print(f"[EP {ep:02d}] train {tr_acc:.4f} | val {va_acc:.4f}")
+    if va_acc > best_val:
+        best_val = va_acc
+        patience_counter = 0
+        torch.save(model.state_dict(), f"{META}/best_model.pth")
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print("Early stopping")
+            break
+
+model.load_state_dict(torch.load(f"{META}/best_model.pth", map_location=DEVICE))
+
+# -------------------------
+# 8) 평가 (ROC)
+# -------------------------
+@torch.no_grad()
+def collect_logits(loader):
+    model.eval()
+    ys, ps = [], []
+    for xb,yb in loader:
+        xb = xb.to(DEVICE, non_blocking=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            prob = torch.softmax(model(xb), dim=1)[:,1].cpu().numpy()  # P(fake)
+        ys.append(yb.numpy()); ps.append(prob)
+    return np.concatenate(ys), np.concatenate(ps)
+
+def plot_roc(y,p,title,path):
+    fpr,tpr,_ = roc_curve(y,p)
+    roc_auc   = auc(fpr,tpr)
+    plt.figure()
+    plt.plot(fpr,tpr,label=f"AUC={roc_auc:.4f}")
+    plt.plot([0,1],[0,1],'--')
+    plt.legend(); plt.title(title)
+    plt.xlabel("FPR"); plt.ylabel("TPR")
+    plt.savefig(path, bbox_inches='tight'); plt.close()
+    return roc_auc
+
+y_val,p_val = collect_logits(val_loader)
+y_te,p_te   = collect_logits(test_loader)
+auc_val     = plot_roc(y_val,p_val,"ROC(val)",f"{META}/roc_val.png")
+auc_te      = plot_roc(y_te,p_te,"ROC(test)",f"{META}/roc_test.png")
+print("[METRICS] AUC val/test =", round(auc_val,4), "/", round(auc_te,4))
+
+
+# -------------------------
+# 9) Grad-CAM + BLIP (오직 Fake만: gt=1) — target=fake(1)
+# -------------------------
+import textwrap
+from transformers import BlipProcessor, BlipForConditionalGeneration
+
+CAP_OUT = f"{META}/runs_resnet50/explanations_fake_only"
+Path(CAP_OUT).mkdir(parents=True, exist_ok=True)
+
+# Grad-CAM hooks
+target_layer = model.layer4
+_feat_maps, _grad_maps = [], []
+
+def _fwd(m, x, y):
+    _feat_maps.append(y.detach())
+
+def _bwd(m, gin, gout):
+    _grad_maps.append(gout[0].detach())
+
+_fh = target_layer.register_forward_hook(_fwd)
+_bh = target_layer.register_full_backward_hook(_bwd)
+
+def grad_cam_batch_target(xb, target_class=1):
+    """항상 target_class(기본=Fake=1) 로짓에 대한 CAM 계산"""
+    _feat_maps.clear()
+    _grad_maps.clear()
+    use_amp = (DEVICE.type == 'cuda')
+    with torch.amp.autocast('cuda' if use_amp else 'cpu'):
+        logits = model(xb)                      # [B,2]
+        score  = logits[:, target_class].sum()  # Fake 로짓 합산
+    model.zero_grad(set_to_none=True)
+    score.backward()
+    feats, grads = _feat_maps[-1], _grad_maps[-1]
+    weights = grads.flatten(2).mean(-1).view(grads.size(0), grads.size(1), 1, 1)
+    cams = torch.relu((weights * feats).sum(1))
+    outs = []
+    for cam in cams:
+        cam_resized = TF.resize(cam.unsqueeze(0), [224,224], antialias=True)[0].detach().cpu().numpy()
+        cam_norm = (cam_resized - cam_resized.min()) / (cam_resized.max() - cam_resized.min() + 1e-8)
+        outs.append(cam_norm)
+    return np.stack(outs)
+
+def cam_to_overlay(pil_img, cam, alpha=0.6):
+    base = np.array(pil_img.convert("RGB"), dtype=np.uint8)
+    heat = (np.clip(cam, 0, 1) * 255).astype(np.uint8)
+    color = cv2.applyColorMap(heat, cv2.COLORMAP_TURBO)[:, :, ::-1]
+    over = cv2.addWeighted(base, 1.0, color, alpha, 0)
+    return Image.fromarray(over)
+
+def describe_cam(cam, thr=0.6):
+    """
+    CAM을 얼굴의 다양한 부분으로 잘게 나눠서 설명.
+    - hairline / upper_forehead / eyes (left/right) / nose
+    - cheeks (left/right) / mouth / chin
+    """
+    H, W = cam.shape
+    m = cam >= thr
+    if not m.any():
+        return ["No strong activation region."]
+
+    # 세로 방향 기준선
+    h1 = H // 3
+    h2 = 2 * H // 3
+    h_hair = int(0.2 * H)
+
+    # 가로 방향 기준선
+    w1 = W // 3
+    w2 = 2 * W // 3
+
+    regions = {
+        "hairline":      m[0:h_hair, w1:w2].mean(),            # 머리카락/헤어라인
+        "upper_forehead":m[h_hair:h1, w1:w2].mean(),           # 이마 위쪽
+        "left_eye":      m[h1:h2, 0:w1].mean(),
+        "right_eye":     m[h1:h2, w2:W].mean(),
+        "nose":          m[h1:h2, w1:w2].mean(),
+        "left_cheek":    m[h2:H, 0:w1].mean(),
+        "mouth":         m[h2:H, w1:w2].mean(),
+        "right_cheek":   m[h2:H, w2:W].mean(),
+    }
+
+    desc = []
+    for k, v in regions.items():
+        if v <= 0.25:
+            continue
+        if k == "hairline":
+            desc.append("Unnatural transitions around hairline or scalp")
+        elif k == "upper_forehead":
+            desc.append("Lighting inconsistency on the upper forehead region")
+        elif k == "left_eye":
+            desc.append("Blending or blur artifacts near the left eye area")
+        elif k == "right_eye":
+            desc.append("Blending or blur artifacts near the right eye area")
+        elif k == "nose":
+            desc.append("Plastic-like or over-smoothed texture around the nose")
+        elif k == "left_cheek":
+            desc.append("Texture mismatch on the left cheek region")
+        elif k == "right_cheek":
+            desc.append("Texture mismatch on the right cheek region")
+        elif k == "mouth":
+            desc.append("Sharp or inconsistent boundaries around mouth and lips")
+
+    if not desc:
+        desc = ["Localized irregular activation on facial region"]
+    return desc
+
+# BLIP (캡션)
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+blip = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(DEVICE).eval()
+
+def caption_image(pil_img):
+    inputs = processor(images=pil_img, return_tensors="pt").to(DEVICE)
+    use_amp = (DEVICE.type == 'cuda')
+    with torch.no_grad(), torch.amp.autocast('cuda' if use_amp else 'cpu'):
+        out = blip.generate(**inputs, max_new_tokens=30)
+    return processor.decode(out[0], skip_special_tokens=True)
+
+def explain_fake_only(loader, split_name="val", max_total=48, also_pred_filter=False, th_fake_high=0.7):
+    """
+    정답이 Fake(=1)인 샘플만 시각화.
+    also_pred_filter=True면 정답 Fake 중에서도 P(fake)>=th_fake_high인 고신뢰만 선택.
+    """
+    records = []
+    saved = 0
+
+    mean_t = torch.tensor(DMEAN, device=DEVICE).view(3,1,1)
+    std_t  = torch.tensor(DSTD,  device=DEVICE).view(3,1,1)
+
+    for xb, yb in loader:
+        mask_fake = (yb == 1)
+        if mask_fake.sum().item() == 0:
+            continue
+
+        xb = xb.to(DEVICE, non_blocking=True)
+        yb = yb.to(DEVICE, non_blocking=True)
+
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.no_grad(), torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            logits = model(xb)                         # [B,2]
+            probs  = torch.softmax(logits, dim=1)      # [:,1]=P(fake)
+
+        idxs = torch.nonzero(mask_fake).squeeze(1)
+
+        if also_pred_filter:
+            idxs = idxs[probs[idxs,1] >= th_fake_high]
+        if len(idxs) == 0:
+            continue
+
+        xb_sel = xb[idxs]
+        cams   = grad_cam_batch_target(xb_sel, target_class=1)  # 항상 fake 로짓
+
+        for j, k in enumerate(idxs.tolist()):
+            if saved >= max_total:
+                break
+
+            p_fake = float(probs[k,1].item())
+            p_real = float(probs[k,0].item())
+            pred   = int(logits[k].argmax().item())
+
+            # 역정규화 (ImageNet mean/std 기준)
+            img = torch.clamp(xb[k] * std_t + mean_t, 0, 1).cpu()
+            pil = TF.to_pil_image(img)
+
+            cam = cams[j]
+            over = cam_to_overlay(pil, cam, alpha=0.6)
+            reason  = describe_cam(cam)
+            caption = caption_image(pil)
+
+            img_path  = f"{CAP_OUT}/{split_name}_{saved:04d}.png"
+            over_path = f"{CAP_OUT}/{split_name}_{saved:04d}_overlay.png"
+            pil.save(img_path); over.save(over_path)
+
+            records.append({
+                "idx_global": saved,
+                "gt": 1,
+                "pred": pred,
+                "p_real": p_real,
+                "p_fake": p_fake,
+                "caption": caption,
+                "reason": " | ".join(reason),
+            })
+            saved += 1
+
+        if saved >= max_total:
+            break
+
+    # CSV 저장
+    csv_path = f"{CAP_OUT}/{split_name}_fake_only.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["idx_global","gt","pred","p_real","p_fake","caption","reason"])
+        w.writeheader()
+        for r in records:
+            w.writerow(r)
+    print(f"[OK] {split_name} fake-only CSV:", csv_path)
+
+        # 패널 시각화 (텍스트를 이미지 아래로)
+    def _shorten(text, width=42, max_lines=2):
+        """
+        긴 문장은 width 글자 단위로 줄바꿈하고,
+        max_lines를 넘으면 ... 붙여서 잘라줌.
+        """
+        if text is None:
+            return ""
+        # 기존 개행/공백 정리
+        text = " ".join(str(text).split())
+        lines = textwrap.wrap(text, width=width)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] += " ..."
+        return "\n".join(lines)
+
+    def show_panel(records):
+        if not records:
+            print("[WARN] records 비어 있음")
+            return
+
+        cols = 4   # 필요하면 3으로 줄이면 이미지 더 큼
+        rows = math.ceil(len(records)/cols)
+
+        # 세로 사이즈를 조금 줄여서 위쪽 여백 줄이기
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
+        axes = np.atleast_1d(axes).ravel()
+
+        for i, r in enumerate(records):
+            ax = axes[i]
+            img = np.concatenate([
+                np.array(Image.open(f"{CAP_OUT}/{split_name}_{r['idx_global']:04d}.png")),
+                np.array(Image.open(f"{CAP_OUT}/{split_name}_{r['idx_global']:04d}_overlay.png"))
+            ], axis=1)
+            ax.imshow(img)
+            ax.axis('off')
+
+            # 캡션/이유 너무 길면 줄바꿈 + 잘라내기
+            cap_short = _shorten(r["caption"], width=42, max_lines=2)
+
+            # reason은 " | " 기준으로 앞에서 2개까지만 사용
+            reason_parts = str(r["reason"]).split(" | ")
+            reason_join  = " | ".join(reason_parts[:2])
+            reason_short = _shorten(reason_join, width=42, max_lines=2)
+
+            header = f"Fake only | P(fake)={r['p_fake']:.2f} (pred:{r['pred']})"
+            note = f"{header}\n{cap_short}\n{reason_short}"
+
+            # y=-0.20 으로 더 아래쪽에 배치
+            ax.text(
+                0.5, -0.20,
+                note,
+                va='top', ha='center',
+                fontsize=8, color='black',
+                transform=ax.transAxes,
+                bbox=dict(boxstyle='round,pad=0.3', fc=(1,1,1,0.85), ec='none')
+            )
+
+        # 남는 칸 비우기
+        for j in range(i+1, rows*cols):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        plt.subplots_adjust(hspace=0.7)
+        plt.show()
+
+    show_panel(records)
+    print(f"[OK] Grad-CAM(target=fake) + BLIP, {split_name} fake-only 시각화 완료. 총 {len(records)}개")
+
+# 실행: 검증셋/테스트셋 중 필요에 따라 호출
+explain_fake_only(val_loader,  split_name="val",  max_total=48, also_pred_filter=False)
+# explain_fake_only(test_loader, split_name="test", max_total=48, also_pred_filter=False)
+
+print("[DONE] Full pipeline (fixed mean/std + detailed facial Grad-CAM) complete.")
+
+# ============================================
+# 10) Test set 전체 BLIP 캡션 CSV 생성
+#  - image_path, label(0/1), label_name(real/fake), blip_caption
+# ============================================
+
+import csv
+from tqdm import tqdm
+
+CAP_CSV_OUT = f"{META}/test_blip_captions.csv"
+
+# ImageFolder를 그대로 쓰되, transform 없이 "경로 + 라벨"만 활용
+test_root = f"{DST}/test"
+
+rows = []
+for cls_name in ["real", "fake"]:
+    cls_dir = os.path.join(test_root, cls_name)
+    label_int = 0 if cls_name == "real" else 1
+    img_paths = sorted(glob.glob(os.path.join(cls_dir, "*")))
+
+    print(f"[INFO] {cls_name} 이미지 {len(img_paths)}개 캡셔닝 중...")
+    for p in tqdm(img_paths):
+        try:
+            pil = Image.open(p).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] 이미지 읽기 실패: {p} ({e})")
+            continue
+
+        # BLIP 캡션 생성 (위에서 정의한 caption_image 재사용)
+        caption = caption_image(pil)
+
+        rows.append({
+            "image_path": p,
+            "label": label_int,
+            "label_name": cls_name,
+            "blip_caption": caption,
+        })
+
+# CSV 저장
+with open(CAP_CSV_OUT, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=["image_path", "label", "label_name", "blip_caption"]
+    )
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+print(f"[OK] Test BLIP 캡션 CSV 저장 완료: {CAP_CSV_OUT}")
+print(f"[INFO] 총 샘플 수: {len(rows)}")
+
+# ============================================
+# 11) Xception baseline 학습 및 평가
+#  - 같은 데이터로 Xception 돌려서 ResNet50과 정량 비교
+# ============================================
+
+import timm
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
+
+# -------------------------
+# 11-1) Xception 모델 정의
+# -------------------------
+def build_xception_baseline(num_classes=2):
+    # timm의 xception 모델 사용 (ImageNet 사전학습)
+    model_x = timm.create_model(
+        "xception",
+        pretrained=True,
+        num_classes=num_classes
+    )
+    return model_x
+
+model_xcp = build_xception_baseline(num_classes=2).to(DEVICE)
+
+optimizer_xcp = optim.AdamW(model_xcp.parameters(), lr=LR, weight_decay=WD)
+criterion_train_xcp = nn.CrossEntropyLoss(label_smoothing=0.1)
+criterion_eval_xcp  = nn.CrossEntropyLoss()
+sched_xcp = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_xcp, T_max=EPOCHS)
+scaler_xcp = torch.amp.GradScaler('cuda' if DEVICE.type=='cuda' else 'cpu')
+
+# -------------------------
+# 11-2) 학습 루프 (Xception 전용)
+# -------------------------
+def run_epoch_xcp(loader, train=True):
+    model_xcp.train() if train else model_xcp.eval()
+    loss_sum, correct, total = 0.0, 0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True)
+        optimizer_xcp.zero_grad(set_to_none=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.set_grad_enabled(train), torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            logits = model_xcp(xb)
+            loss = criterion_train_xcp(logits, yb) if train else criterion_eval_xcp(logits, yb)
+        if train:
+            scaler_xcp.scale(loss).backward()
+            scaler_xcp.step(optimizer_xcp)
+            scaler_xcp.update()
+        pred = logits.argmax(1)
+        correct += (pred == yb).sum().item()
+        loss_sum += float(loss.item()) * xb.size(0)
+        total += xb.size(0)
+    return loss_sum / total, correct / total
+
+best_val_xcp = 0.0
+patience_xcp = 5
+pat_xcp = 0
+
+for ep in range(1, EPOCHS + 1):
+    tr_loss, tr_acc = run_epoch_xcp(train_loader, True)
+    va_loss, va_acc = run_epoch_xcp(val_loader,   False)
+    sched_xcp.step()
+    print(f"[XCP][EP {ep:02d}] train {tr_acc:.4f} | val {va_acc:.4f}")
+    if va_acc > best_val_xcp:
+        best_val_xcp = va_acc
+        pat_xcp = 0
+        torch.save(model_xcp.state_dict(), f"{META}/best_model_xception.pth")
+    else:
+        pat_xcp += 1
+        if pat_xcp >= patience_xcp:
+            print("[XCP] Early stopping")
+            break
+
+# 최적 모델 로드
+model_xcp.load_state_dict(torch.load(f"{META}/best_model_xception.pth", map_location=DEVICE))
+
+# -------------------------
+# 11-3) 평가 함수 (ROC + 분류 리포트)
+# -------------------------
+@torch.no_grad()
+def collect_logits_generic(model_eval, loader):
+    model_eval.eval()
+    ys, ps = [], []
+    for xb, yb in loader:
+        xb = xb.to(DEVICE, non_blocking=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            prob = torch.softmax(model_eval(xb), dim=1)[:, 1].cpu().numpy()  # P(fake)
+        ys.append(yb.numpy()); ps.append(prob)
+    return np.concatenate(ys), np.concatenate(ps)
+
+@torch.no_grad()
+def collect_pred_labels_generic(model_eval, loader):
+    model_eval.eval()
+    ys, yhat = [], []
+    for xb, yb in loader:
+        xb = xb.to(DEVICE, non_blocking=True)
+        use_amp = (DEVICE.type == 'cuda')
+        with torch.amp.autocast('cuda' if use_amp else 'cpu'):
+            logits = model_eval(xb)
+        preds = logits.argmax(1).cpu().numpy()
+        ys.append(yb.numpy()); yhat.append(preds)
+    return np.concatenate(ys), np.concatenate(yhat)
+
+def eval_xception_on_split(model_eval, loader, split_name="val"):
+    # ROC / AUC
+    y_true_prob, y_pred_prob = collect_logits_generic(model_eval, loader)
+    fpr, tpr, _ = roc_curve(y_true_prob, y_pred_prob)
+    auc_score = auc(fpr, tpr)
+
+    plt.figure()
+    plt.plot(fpr, tpr, label=f"AUC={auc_score:.4f}")
+    plt.plot([0,1],[0,1],'--')
+    plt.legend(); plt.title(f"Xception ROC ({split_name})")
+    plt.xlabel("FPR"); plt.ylabel("TPR")
+    plt.savefig(f"{META}/xception_roc_{split_name}.png", bbox_inches='tight')
+    plt.close()
+
+    # 분류 리포트 / 혼동행렬
+    y_true, y_hat = collect_pred_labels_generic(model_eval, loader)
+    print(f"\n[Xception] {split_name} classification report")
+    print(classification_report(y_true, y_hat, target_names=["real(0)","fake(1)"]))
+    print(f"[Xception] {split_name} confusion matrix")
+    print(confusion_matrix(y_true, y_hat))
+
+    acc = (y_true == y_hat).mean()
+    return acc, auc_score
+
+# 실제 평가
+acc_val_xcp, auc_val_xcp = eval_xception_on_split(model_xcp, val_loader,  split_name="val")
+acc_te_xcp,  auc_te_xcp  = eval_xception_on_split(model_xcp, test_loader, split_name="test")
+
+print("\n================ Xception Baseline 결과 ================")
+print(f"VAL  - Acc: {acc_val_xcp:.4f}, AUC: {auc_val_xcp:.44f}")
+print(f"TEST - Acc: {acc_te_xcp:.4f}, AUC: {auc_te_xcp:.4f}")
+print("========================================================")
+
+# ============================================
+# 12) CLIPScore 계산 (이미지 vs BLIP 캡션)
+#  - 입력: META/test_blip_captions.csv
+#  - 출력: META/test_blip_captions_clip.csv (clip_score 컬럼 추가)
+# ============================================
+
+!pip install -q ftfy regex
+!pip install -q git+https://github.com/openai/CLIP.git
+
+import clip
+import csv
+from tqdm import tqdm
+
+# CLIP 모델 불러오기 (ViT-B/32)
+clip_model, clip_preprocess = clip.load("ViT-B/32", device=DEVICE)
+
+CAP_CSV_IN  = f"{META}/test_blip_captions.csv"
+CAP_CSV_OUT = f"{META}/test_blip_captions_clip.csv"
+
+rows = []
+with open(CAP_CSV_IN, "r", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    for r in reader:
+        rows.append(r)
+
+print(f"[INFO] 캡션 샘플 수: {len(rows)}")
+
+clip_scores = []
+
+for r in tqdm(rows):
+    img_path = r["image_path"]
+    caption  = r["blip_caption"]
+
+    try:
+        img = Image.open(img_path).convert("RGB")
+    except Exception as e:
+        print(f"[WARN] 이미지 로드 실패: {img_path} ({e})")
+        r["clip_score"] = ""
+        continue
+
+    # CLIP 전처리
+    img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
+    text_tokens = clip.tokenize([caption]).to(DEVICE)
+
+    with torch.no_grad():
+        img_feat  = clip_model.encode_image(img_tensor)
+        text_feat = clip_model.encode_text(text_tokens)
+
+    # 정규화 후 cosine similarity
+    img_feat  = img_feat / img_feat.norm(dim=-1, keepdim=True)
+    text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+
+    score = (img_feat @ text_feat.T).item()
+    r["clip_score"] = score
+    clip_scores.append(score)
+
+# 새 CSV 저장 (clip_score 포함)
+with open(CAP_CSV_OUT, "w", newline="", encoding="utf-8") as f:
+    fieldnames = list(rows[0].keys())
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+print(f"[OK] CLIPScore 계산 완료 → {CAP_CSV_OUT}")
+if clip_scores:
+    clip_scores = np.array(clip_scores, dtype=np.float32)
+    print(f"[STATS] CLIPScore mean = {clip_scores.mean():.4f}, std = {clip_scores.std():.4f}")
+
+    # 히스토그램 저장
+    plt.figure()
+    plt.hist(clip_scores, bins=30)
+    plt.title("CLIPScore distribution (image vs BLIP caption)")
+    plt.xlabel("CLIPScore")
+    plt.ylabel("Count")
+    plt.savefig(f"{META}/clipscore_hist_test.png", bbox_inches="tight")
+    plt.close()
+    print(f"[OK] 히스토그램 저장: {META}/clipscore_hist_test.png")
+else:
+    print("[WARN] 유효한 CLIPScore가 없음")
+
+
+
+이 코드 그럼 깃허브에 정리하면 되는 거 맞아?
