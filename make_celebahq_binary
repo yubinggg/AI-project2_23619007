@@ -1,0 +1,248 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+# ======================================
+# 0) 기본 설정
+# ======================================
+import os, shutil, random, glob, hashlib, json, re
+from pathlib import Path
+from PIL import Image
+import pandas as pd
+
+# === 경로/옵션 설정 ===
+ROOT_DRIVE = "/content/drive/MyDrive"
+SRC_REAL   = f"{ROOT_DRIVE}/CelebA-HQ"                # Real 최상위 폴더(재귀 탐색)
+DST        = f"{ROOT_DRIVE}/celeba_hq_binary"         # 최종 ImageFolder(root)
+RESIZED_DST= f"{ROOT_DRIVE}/celeba_hq_binary_224"     
+FAKES_ROOT = f"{ROOT_DRIVE}/fakes/stylegan2_celebahq" # 가짜 생성 원본 저장
+
+NETWORK = "https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-celebahq-256x256.pkl"
+PSI_MAIN = 0.7
+NOISE_MAIN = "const" 
+
+# seed 분할(누수 방지)
+SEED_TRAIN = (1, 21000)
+SEED_VAL   = (21001, 25500)
+SEED_TEST  = (25501, 30000)
+
+# 재현성
+SEED = 42
+random.seed(SEED)
+
+
+def safe_rmtree(p):
+    assert p.startswith("/content/drive/"), f"Refusing to delete: {p}"
+    for forbid in ["/", "/content", "/content/drive", "/content/drive/MyDrive"]:
+        assert p != forbid, f"Refusing to delete root-like path: {p}"
+    shutil.rmtree(p, ignore_errors=True)
+
+
+# 싹 지움(주의)
+for p in [DST, RESIZED_DST, FAKES_ROOT]:
+    safe_rmtree(p)
+for sp in ["train", "val", "test"]:
+    Path(f"{DST}/{sp}/real").mkdir(parents=True, exist_ok=True)
+    Path(f"{DST}/{sp}/fake").mkdir(parents=True, exist_ok=True)
+
+assert os.path.exists(SRC_REAL), f"SRC_REAL not found: {SRC_REAL}"
+print("[OK] paths ready")
+
+# ======================================
+# 2) StyleGAN2-ADA 코드 받기
+# ======================================
+if not os.path.isdir("/content/stylegan2-ada-pytorch"):
+    !git clone https://github.com/NVlabs/stylegan2-ada-pytorch.git
+%cd /content/stylegan2-ada-pytorch
+
+# ======================================
+# 3) Fake 생성 (메인셋 ψ=0.7, noise=const)
+#    A_main_psi0.7_noise-const/seed000001.png ... seed030000.png
+# ======================================
+import subprocess, shlex
+
+def gen_range(outdir, seed_start, seed_end, trunc, noise_mode, network):
+    os.makedirs(outdir, exist_ok=True)
+    cmd = f"""
+    python generate.py \
+      --outdir="{outdir}" \
+      --seeds={seed_start}-{seed_end} \
+      --trunc={trunc} \
+      --noise-mode={noise_mode} \
+      --network="{network}"
+    """
+    print(cmd)
+    subprocess.run(shlex.split(cmd), check=True)
+
+A_DIR = f"{FAKES_ROOT}/A_main_psi{PSI_MAIN}_noise-{NOISE_MAIN}"
+gen_range(A_DIR, 1, 30000, PSI_MAIN, NOISE_MAIN, NETWORK)
+
+%cd /content
+
+# ======================================
+# 4) Fake → ImageFolder로 분배(Seed 구간 기준)
+# ======================================
+def seed_from_name(name: str) -> int:
+    m = re.search(r"seed(\d+)", name)
+    return int(m.group(1)) if m else None
+
+def place_file(src_path, dst_dir):
+    Path(dst_dir).mkdir(parents=True, exist_ok=True)
+    dst_path = os.path.join(dst_dir, os.path.basename(src_path))
+    if not os.path.exists(dst_path):
+        shutil.copy2(src_path, dst_path)
+
+fake_paths = sorted(glob.glob(f"{A_DIR}/seed*.png"))
+assert len(fake_paths) == 30000, f"expected 30000 fakes, got {len(fake_paths)}"
+
+for p in fake_paths:
+    s = seed_from_name(os.path.basename(p))
+    if s is None:
+        continue
+    if SEED_TRAIN[0] <= s <= SEED_TRAIN[1]:
+        place_file(p, f"{DST}/train/fake")
+    elif SEED_VAL[0] <= s <= SEED_VAL[1]:
+        place_file(p, f"{DST}/val/fake")
+    elif SEED_TEST[0] <= s <= SEED_TEST[1]:
+        place_file(p, f"{DST}/test/fake")
+
+# ======================================
+# 5) Real → ImageFolder로 분배(수량 매칭)
+#    train/val/test 각각 fake 개수와 동일 수량으로 real 구성
+# ======================================
+valid_ext = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+all_real = []
+for root, _, files in os.walk(SRC_REAL):
+    for f in files:
+        if Path(f).suffix.lower() in valid_ext:
+            all_real.append(os.path.join(root, f))
+if not all_real:
+    raise SystemExit(f"[ERR] No images found under {SRC_REAL}")
+
+random.shuffle(all_real)
+
+def count_dir_images(d):
+    return len([
+        f for f in glob.glob(os.path.join(d, "*"))
+        if Path(f).suffix.lower() in valid_ext
+    ])
+
+n_train_fake = count_dir_images(f"{DST}/train/fake")
+n_val_fake   = count_dir_images(f"{DST}/val/fake")
+n_test_fake  = count_dir_images(f"{DST}/test/fake")
+need_total   = n_train_fake + n_val_fake + n_test_fake
+assert len(all_real) >= need_total, \
+    f"Not enough real images: need {need_total}, have {len(all_real)}"
+
+# 분배
+def copy_many(src_list, dst_dir, k):
+    Path(dst_dir).mkdir(parents=True, exist_ok=True)
+    for p in src_list[:k]:
+        place_file(p, dst_dir)
+    return src_list[k:]
+
+pool = all_real[:]
+pool = copy_many(pool, f"{DST}/train/real", n_train_fake)
+pool = copy_many(pool, f"{DST}/val/real",   n_val_fake)
+pool = copy_many(pool, f"{DST}/test/real",  n_test_fake)
+
+print("[COUNT] fake:", {
+    "train": n_train_fake,
+    "val":   n_val_fake,
+    "test":  n_test_fake
+})
+print("[COUNT] real:", {
+    "train": count_dir_images(f"{DST}/train/real"),
+    "val":   count_dir_images(f"{DST}/val/real"),
+    "test":  count_dir_images(f"{DST}/test/real"),
+})
+
+# ======================================
+# 6) Manifest 생성 (메인셋)
+#    컬럼: split,label(0/1),path,fname,seed,psi,noise,network,variant,resolution
+# ======================================
+rows = []
+
+def add_dir(split, label_name):
+    label = 1 if label_name == "fake" else 0
+    d = f"{DST}/{split}/{label_name}"
+    for fp in sorted(glob.glob(f"{d}/*")):
+        if Path(fp).suffix.lower() not in valid_ext:
+            continue
+        fname = os.path.basename(fp)
+        w = h = None
+        try:
+            with Image.open(fp) as im:
+                w, h = im.size
+        except:
+            pass
+        seed = None
+        if label == 1:
+            seed = seed_from_name(fname)
+        rows.append({
+            "split": split,
+            "label": label,
+            "path": fp,
+            "fname": fname,
+            "seed": seed if seed is not None else "",
+            "psi": PSI_MAIN if label == 1 else "",
+            "noise": NOISE_MAIN if label == 1 else "",
+            "network": "stylegan2-celebahq-256x256.pkl" if label == 1 else "",
+            "variant": "A_main_psi0.7_noise-const" if label == 1 else "",
+            "resolution": f"{w}x{h}" if (w and h) else ""
+        })
+
+for sp in ["train", "val", "test"]:
+    add_dir(sp, "real")
+    add_dir(sp, "fake")
+
+manifest_path = f"{DST}/meta"
+Path(manifest_path).mkdir(parents=True, exist_ok=True)
+FINAL_MANIFEST = f"{manifest_path}/dataset_manifest.csv"
+pd.DataFrame(rows).to_csv(FINAL_MANIFEST, index=False)
+print("[OK] manifest:", FINAL_MANIFEST)
+
+# ======================================
+# 7) 무결성/중복 체크
+# ======================================
+def md5sum(p):
+    m = hashlib.md5()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            m.update(chunk)
+    return m.hexdigest()
+
+# 파일명 중복
+from collections import Counter
+
+names = []
+for sp in ["train", "val", "test"]:
+    for lb in ["real", "fake"]:
+        for f in glob.glob(f"{DST}/{sp}/{lb}/*"):
+            if Path(f).suffix.lower() in valid_ext:
+                names.append(os.path.basename(f))
+
+dup_names = [k for k, v in Counter(names).items() if v > 1]
+print("[DUP-NAMES]", len(dup_names))
+
+# 내용 중복(hash)
+seen, dups = {}, []
+for sp in ["train", "val", "test"]:
+    for lb in ["real", "fake"]:
+        for p in Path(f"{DST}/{sp}/{lb}").glob("*"):
+            if p.suffix.lower() not in valid_ext:
+                continue
+            h = md5sum(str(p))
+            if h in seen:
+                dups.append((str(p), seen[h]))
+            else:
+                seen[h] = str(p)
+print("[DUP-CONTENT]", len(dups))
+if dups[:5]:
+    print("[DUP-SAMPLE]", dups[:5])
+
+# 요약 출력
+df = pd.read_csv(FINAL_MANIFEST)
+print()
+print("[SUMMARY BY SPLIT/LABEL]")
+print(df.groupby(["split", "label"]).size().unstack(fill_value=0))
